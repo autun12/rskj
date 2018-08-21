@@ -20,9 +20,12 @@
 package org.ethereum.net.server;
 
 import io.netty.channel.*;
+import io.netty.channel.socket.SocketChannelConfig;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.net.InetAddress;
 
 public class EthereumChannelInitializer extends ChannelInitializer<NioSocketChannel> {
 
@@ -39,15 +42,23 @@ public class EthereumChannelInitializer extends ChannelInitializer<NioSocketChan
     }
 
     @Override
-    public void initChannel(NioSocketChannel ch) throws Exception {
+    public void initChannel(NioSocketChannel ch) {
         try {
             logger.info("Open {} connection, channel: {}", isInbound() ? "inbound" : "outbound", ch);
 
-            if (isInbound() && channelManager.isRecentlyDisconnected(ch.remoteAddress().getAddress())) {
-                // avoid too frequent connection attempts
-                logger.info("Drop connection - the same IP was disconnected recently, channel: {}", ch);
-                ch.disconnect();
-                return;
+            if (isInbound()) {
+                InetAddress address = ch.remoteAddress().getAddress();
+                if (channelManager.isRecentlyDisconnected(address)) {
+                    // avoid too frequent connection attempts
+                    logger.info("Drop connection - the same IP was disconnected recently, channel: {}", ch);
+                    ch.disconnect();
+                    return;
+                } else if (!channelManager.isAddressBlockAvailable(address)) {
+                    // avoid too many connection from same block
+                    logger.info("IP range is full, IP {} is not accepted for new connection", address);
+                    ch.disconnect();
+                    return;
+                }
             }
 
             final Channel channel = channelFactory.newInstance();
@@ -55,12 +66,13 @@ public class EthereumChannelInitializer extends ChannelInitializer<NioSocketChan
             channelManager.add(channel);
 
             // limit the size of receiving buffer to 1024
-            ch.config().setRecvByteBufAllocator(new FixedRecvByteBufAllocator(16_777_216));
-            ch.config().setOption(ChannelOption.SO_RCVBUF, 16_777_216);
-            ch.config().setOption(ChannelOption.SO_BACKLOG, 1024);
+            SocketChannelConfig channelConfig = ch.config();
+            channelConfig.setRecvByteBufAllocator(new FixedRecvByteBufAllocator(16_777_216));
+            channelConfig.setOption(ChannelOption.SO_RCVBUF, 16_777_216);
+            channelConfig.setOption(ChannelOption.SO_BACKLOG, 1024);
 
             // be aware of channel closing
-            ch.closeFuture().addListener(f -> channelManager.notifyDisconnect(channel));
+            ch.closeFuture().addListener(future -> channelManager.notifyDisconnect(channel));
 
         } catch (Exception e) {
             logger.error("Unexpected error: ", e);
