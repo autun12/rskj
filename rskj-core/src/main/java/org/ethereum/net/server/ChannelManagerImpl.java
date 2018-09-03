@@ -26,8 +26,8 @@ import co.rsk.net.Status;
 import co.rsk.net.eth.RskMessage;
 import co.rsk.net.messages.*;
 import co.rsk.scoring.InetAddressBlock;
+import co.rsk.util.MaxSizeHashMap;
 import com.google.common.annotations.VisibleForTesting;
-import org.apache.commons.collections4.map.LRUMap;
 import org.ethereum.config.NodeFilter;
 import org.ethereum.core.Block;
 import org.ethereum.core.BlockIdentifier;
@@ -59,15 +59,18 @@ public class ChannelManagerImpl implements ChannelManager {
     // then we ban that peer IP on any connections for some time to protect from
     // too active peers
     private static final int INBOUND_CONNECTION_BAN_TIMEOUT = 10 * 1000;
-    private final Map<NodeID, Channel> activePeers = new ConcurrentHashMap<>();
+    private static final int MAX_DISCONNECTED_SIZE = 500;
+    private final Object activePeersLock = new Object();
+    private final Map<NodeID, Channel> activePeers;
 
     // Using a concurrent list
     // (the add and remove methods copy an internal array,
     // but the iterator directly use the internal array)
-    private final List<Channel> newPeers = new CopyOnWriteArrayList<>();
+    private final List<Channel> newPeers;
 
     private final ScheduledExecutorService mainWorker;
-    private final Map<InetAddress, Date> recentlyDisconnected = Collections.synchronizedMap(new LRUMap<>(500));
+    private Map<InetAddress, Date> recentlyDisconnected;
+    private final Object recentlyDisconnectedLock = new Object();
 
     private final SyncPool syncPool;
     private final NodeFilter trustedPeers;
@@ -81,9 +84,11 @@ public class ChannelManagerImpl implements ChannelManager {
         this.syncPool = syncPool;
         this.maxActivePeers = config.maxActivePeers();
         this.trustedPeers = config.peerTrusted();
-        // TODO(lsebrie): move values to configuration
-        this.maxConnectionsPerBlock = 5;
-        this.bitsToIgnore = 24;
+        this.recentlyDisconnected = new MaxSizeHashMap<>(MAX_DISCONNECTED_SIZE, true);
+        this.activePeers = new ConcurrentHashMap<>();
+        this.newPeers = new CopyOnWriteArrayList<>();
+        this.maxConnectionsPerBlock = config.maxConnectionsPerAddressBlock();
+        this.bitsToIgnore = config.bitsToIgnore();
     }
 
     @Override
@@ -109,16 +114,19 @@ public class ChannelManagerImpl implements ChannelManager {
     }
 
     private void processNewPeers() {
-        List<Channel> initialized = newPeers.stream().filter(Channel::isProtocolsInitialized).collect(Collectors.toList());
-        initialized.forEach(channel -> {
-            ReasonCode reason = getNewPeerDisconnectionReason(channel);
-            if (reason != null) {
-                disconnect(channel, reason);
-            } else {
-                 process(channel);
-            }
-        });
-        newPeers.removeAll(initialized);
+        List<Channel> processedChannels = new ArrayList<>();
+        newPeers.stream().filter(Channel::isProtocolsInitialized).forEach(c -> processNewPeer(c, processedChannels));
+        newPeers.removeAll(processedChannels);
+    }
+
+    private void processNewPeer(Channel channel, List<Channel> processedChannels) {
+        ReasonCode reason = getNewPeerDisconnectionReason(channel);
+        if (reason != null) {
+            disconnect(channel, reason);
+        } else {
+            addToActives(channel);
+        }
+        processedChannels.add(channel);
     }
 
     private ReasonCode getNewPeerDisconnectionReason(Channel channel) {
@@ -126,9 +134,7 @@ public class ChannelManagerImpl implements ChannelManager {
             return ReasonCode.DUPLICATE_PEER;
         }
 
-        if (!channel.isActive() &&
-                activePeers.size() >= maxActivePeers &&
-                !trustedPeers.accept(channel.getNode())) {
+        if (!channel.isActive() && activePeers.size() >= maxActivePeers && !trustedPeers.accept(channel.getNode())) {
             return ReasonCode.TOO_MANY_PEERS;
         }
 
@@ -138,24 +144,33 @@ public class ChannelManagerImpl implements ChannelManager {
     private void disconnect(Channel peer, ReasonCode reason) {
         logger.debug("Disconnecting peer with reason {} : {}", reason, peer);
         peer.disconnect(reason);
-        recentlyDisconnected.put(peer.getInetSocketAddress().getAddress(), new Date());
+        synchronized (recentlyDisconnectedLock){
+            recentlyDisconnected.put(peer.getInetSocketAddress().getAddress(), new Date());
+        }
     }
 
     public boolean isRecentlyDisconnected(InetAddress peerAddr) {
-        Date disconnectTime = recentlyDisconnected.get(peerAddr);
-        if (disconnectTime != null &&
-                System.currentTimeMillis() - disconnectTime.getTime() < INBOUND_CONNECTION_BAN_TIMEOUT) {
-            return true;
-        } else {
-            recentlyDisconnected.remove(peerAddr);
+        synchronized (recentlyDisconnectedLock) {
+            Date disconnectTime = recentlyDisconnected.get(peerAddr);
+            if (disconnectTime != null) {
+                boolean isRecently = isRecently(disconnectTime, System.currentTimeMillis());
+                if (!isRecently) {
+                    recentlyDisconnected.remove(peerAddr);
+                }
+                return isRecently;
+            }
             return false;
         }
     }
 
-    private void process(Channel peer) {
+    private boolean isRecently(Date disconnectTime, long currentTime) {
+        return currentTime - disconnectTime.getTime() < INBOUND_CONNECTION_BAN_TIMEOUT;
+    }
+
+    private void addToActives(Channel peer) {
         if (peer.isUsingNewProtocol() || peer.hasEthStatusSucceeded()) {
             syncPool.add(peer);
-            synchronized (activePeers) {
+            synchronized (activePeersLock){
                 activePeers.put(peer.getNodeId(), peer);
             }
         }
@@ -175,7 +190,7 @@ public class ChannelManagerImpl implements ChannelManager {
         final BlockIdentifier bi = new BlockIdentifier(block.getHash().getBytes(), block.getNumber());
         final EthMessage newBlock = new RskMessage(new BlockMessage(block));
         final EthMessage newBlockHashes = new RskMessage(new NewBlockHashesMessage(Arrays.asList(bi)));
-        synchronized (activePeers) {
+        synchronized (activePeersLock){
             // Get a randomized list with all the peers that don't have the block yet.
             activePeers.values().forEach(c -> logger.trace("RSK activePeers: {}", c));
             List<Channel> peers = new ArrayList<>(activePeers.values());
@@ -203,7 +218,7 @@ public class ChannelManagerImpl implements ChannelManager {
         final Set<NodeID> nodesIdsBroadcastedTo = new HashSet<>();
         final EthMessage newBlockHash = new RskMessage(new NewBlockHashesMessage(identifiers));
 
-        synchronized (activePeers) {
+        synchronized (activePeersLock){
             activePeers.values().forEach(c -> logger.trace("RSK activePeers: {}", c));
 
             activePeers.values().stream()
@@ -246,7 +261,7 @@ public class ChannelManagerImpl implements ChannelManager {
     @Override
     public int broadcastStatus(Status status) {
         final EthMessage message = new RskMessage(new StatusMessage(status));
-        synchronized (activePeers) {
+        synchronized (activePeersLock){
             if (activePeers.isEmpty()) {
                 return 0;
             }
@@ -269,7 +284,6 @@ public class ChannelManagerImpl implements ChannelManager {
         return Math.min(10, Math.min(Math.max(3, peerCountSqrt), peerCount));
     }
 
-
     public void add(Channel peer) {
         newPeers.add(peer);
     }
@@ -278,7 +292,7 @@ public class ChannelManagerImpl implements ChannelManager {
         logger.debug("Peer {}: notifies about disconnect", channel.getPeerIdShort());
         channel.onDisconnect();
         syncPool.onDisconnect(channel);
-        synchronized (activePeers) {
+        synchronized (activePeersLock){
             activePeers.values().remove(channel);
         }
         if(newPeers.remove(channel)) {
@@ -291,7 +305,10 @@ public class ChannelManagerImpl implements ChannelManager {
     }
 
     public Collection<Channel> getActivePeers() {
-        return Collections.unmodifiableCollection(activePeers.values());
+        // from the docs: it is imperative to synchronize when iterating
+        synchronized (activePeersLock){
+            return new ArrayList<>(activePeers.values());
+        }
     }
 
     @Override
