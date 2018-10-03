@@ -19,7 +19,6 @@
 
 package org.ethereum.net.server;
 
-import co.rsk.config.RskSystemProperties;
 import co.rsk.net.NodeID;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
@@ -79,14 +78,15 @@ public class Channel {
     private final PeerStatistics peerStats = new PeerStatistics();
     private final Integer peerChannelReadTimeout;
 
-    public Channel(RskSystemProperties config,
-                   MessageQueue msgQueue,
-                   P2pHandler p2pHandler,
-                   MessageCodec messageCodec,
-                   HandshakeHandler handshakeHandler,
-                   NodeManager nodeManager,
-                   EthHandlerFactory ethHandlerFactory,
-                   StaticMessages staticMessages) {
+    public Channel(
+            MessageQueue msgQueue,
+            P2pHandler p2pHandler,
+            MessageCodec messageCodec,
+            HandshakeHandler handshakeHandler,
+            NodeManager nodeManager,
+            EthHandlerFactory ethHandlerFactory,
+            StaticMessages staticMessages,
+            Integer peerChannelReadTimeout) {
         this.msgQueue = msgQueue;
         this.p2pHandler = p2pHandler;
         this.messageCodec = messageCodec;
@@ -94,7 +94,7 @@ public class Channel {
         this.nodeManager = nodeManager;
         this.ethHandlerFactory = ethHandlerFactory;
         this.staticMessages = staticMessages;
-        this.peerChannelReadTimeout = config.peerChannelReadTimeout();
+        this.peerChannelReadTimeout = peerChannelReadTimeout;
     }
 
     public void init(ChannelPipeline pipeline, String remoteId) {

@@ -280,7 +280,10 @@ public class RskFactory {
             MessageQueue messageQueue = new MessageQueue();
             P2pHandler p2pHandler = new P2pHandler(config, ethereumListener, configCapabilities);
             MessageCodec messageCodec = new MessageCodec(ethereumListener, config);
-            return new Channel(config, messageQueue, p2pHandler, messageCodec, handshakeHandler, nodeManager, ethHandlerFactory, staticMessages);
+            return new Channel(
+                    messageQueue, p2pHandler, messageCodec, handshakeHandler, nodeManager, ethHandlerFactory, staticMessages,
+                    config.peerChannelReadTimeout()
+            );
         };
     }
 

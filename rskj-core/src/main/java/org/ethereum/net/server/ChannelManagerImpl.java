@@ -101,7 +101,8 @@ public class ChannelManagerImpl implements ChannelManager {
         mainWorker.shutdown();
     }
 
-    private void tryProcessNewPeers() {
+    @VisibleForTesting
+    public void tryProcessNewPeers() {
         if (newPeers.isEmpty()) {
             return;
         }
@@ -323,12 +324,14 @@ public class ChannelManagerImpl implements ChannelManager {
     }
 
     public boolean isAddressBlockAvailable(InetAddress inetAddress) {
-        //TODO(lsebrie): save block address in a data structure and keep updated on each channel add/remove
-        //TODO(lsebrie): check if we need to use a different cidr for ipv6
-        return activePeers.values().stream()
-                .map(ch -> new InetAddressBlock(ch.getInetSocketAddress().getAddress(), bitsToIgnore))
-                .filter(block -> block.contains(inetAddress))
-                .count() < maxConnectionsPerBlock;
+        synchronized (activePeersLock) {
+            //TODO(lsebrie): save block address in a data structure and keep updated on each channel add/remove
+            //TODO(lsebrie): check if we need to use a different cidr for ipv6
+            return activePeers.values().stream()
+                    .map(ch -> new InetAddressBlock(ch.getInetSocketAddress().getAddress(), bitsToIgnore))
+                    .filter(block -> block.contains(inetAddress))
+                    .count() < maxConnectionsPerBlock;
+        }
     }
 
 }
